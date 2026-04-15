@@ -26,7 +26,7 @@ except ImportError:
     DEEPSEEK_API_KEY = ""
 
 
-PROJECT_DIR = Path("/Users/stevenchen/Desktop/Voc")
+PROJECT_DIR = Path(__file__).resolve().parent
 DATABASE_DIR = PROJECT_DIR / "Voc_Database"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 DEFAULT_BOOK_NAME = "默认词库"

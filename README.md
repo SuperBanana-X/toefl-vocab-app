@@ -12,8 +12,6 @@
 
 ## 安装依赖
 
-其他电脑一般执行：
-
 ```bash
 pip install -r requirements.txt
 ```
@@ -29,19 +27,13 @@ DEEPSEEK_API_KEY = "你的 key"
 
 ## 数据目录
 
-项目目录固定为：
+程序会以当前项目所在文件夹作为项目根目录。也就是说，不管把项目下载到哪里，数据库都会自动创建在项目根目录下：
 
 ```text
-/Users/stevenchen/Desktop/Voc
+./Voc_Database
 ```
 
-数据库目录为：
-
-```text
-/Users/stevenchen/Desktop/Voc/Voc_Database
-```
-
-每个单词本都是一个独立文件夹：
+每个单词本都是 `Voc_Database/` 下面的一个独立文件夹：
 
 ```text
 Voc_Database/
@@ -50,6 +42,8 @@ Voc_Database/
     ├── words.xlsx
     └── backups/
 ```
+
+`Voc_Database/` 保存你的本地词库和 Excel 数据，默认已被 `.gitignore` 忽略，不会上传到 GitHub。
 
 ## 功能
 
