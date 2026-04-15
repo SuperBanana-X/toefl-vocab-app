@@ -68,7 +68,6 @@ CUSTOM_OPENAI_COMPATIBLE_BASE_URL = "https://你的服务地址/v1"
 CUSTOM_OPENAI_COMPATIBLE_MODEL = "模型名"
 ```
 
-`ai_config.py` 已被 `.gitignore` 忽略，不会上传 GitHub。
 
 ## 数据目录
 
@@ -92,7 +91,7 @@ Voc_Database/
 ## 功能
 
 - 新建、切换、改名单词本
-- 输入英文单词后调用你选择的 AI provider 补全 TOEFL 向资料
+- 输入英文单词后调用你选择的 AI provider 补全
 - 本地已有同词资料时优先复用缓存，减少 token 消耗
 - 所有单词保存到对应单词本的 `words.xlsx`
 - 复习时根据 `Next_Review` 实时判断是否到期
