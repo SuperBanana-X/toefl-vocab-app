@@ -1,0 +1,13 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Secrets
+deepseek_config.py
+
+# Local database
+Voc_Database/
+*.xlsx
+
+# macOS
+.DS_Store
