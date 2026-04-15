@@ -117,3 +117,7 @@ Voc_Database/
 ## 注意
 
 如果正在用 Excel 打开某个 `words.xlsx`，程序可能无法保存。保存新词或复习结果前，最好先关闭对应 Excel 文件。
+
+## License
+
+This project is licensed under the MIT License.
