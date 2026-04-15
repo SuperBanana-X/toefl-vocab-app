@@ -11,3 +11,6 @@ Voc_Database/
 
 # macOS
 .DS_Store
+
+# Local-only launcher
+run_app_local.sh

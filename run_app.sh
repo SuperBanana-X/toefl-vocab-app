@@ -1,3 +1,3 @@
 #!/bin/zsh
-cd /Users/stevenchen/Desktop/Voc || exit 1
-/opt/anaconda3/bin/streamlit run vocab_app.py
+cd "$(dirname "$0")" || exit 1
+python3 -m streamlit run vocab_app.py

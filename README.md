@@ -2,11 +2,23 @@
 
 这是一个用 Streamlit 做面板、用 Excel 做本地数据库的 TOEFL 背单词小程序。
 
-请用项目里的启动脚本，它会固定调用 Anaconda 环境里的 Streamlit：
+## 运行
+
+通用运行方式，适合 GitHub 上的其他用户：
 
 ```bash
 ./run_app.sh
 ```
+
+`run_app.sh` 会使用当前环境里的 `python3 -m streamlit`，所以别人只要装好依赖就能运行。
+
+你这台电脑的普通 `python3` 目前会被系统 kill，所以你自己本机建议用本地专用脚本：
+
+```bash
+./run_app_local.sh
+```
+
+`run_app_local.sh` 固定调用 `/opt/anaconda3/bin/streamlit`，并且已经写进 `.gitignore`，不会上传 GitHub。
 
 启动后浏览器会打开本地页面，通常是：
 
@@ -16,7 +28,13 @@ http://localhost:8501
 
 ## 安装依赖
 
-如果第一次运行缺包，执行：
+其他电脑一般执行：
+
+```bash
+pip install -r requirements.txt
+```
+
+你这台电脑如果第一次运行缺包，执行：
 
 ```bash
 /opt/anaconda3/bin/pip install -r requirements.txt
