@@ -21,9 +21,9 @@ except ImportError:
     st = None
 
 try:
-    from deepseek_config import DEEPSEEK_API_KEY
+    import ai_config
 except ImportError:
-    DEEPSEEK_API_KEY = ""
+    ai_config = None
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -97,6 +97,12 @@ class VocabDataError(Exception):
 
 class DeepSeekError(Exception):
     pass
+
+
+def config_value(name: str, default: str = "") -> str:
+    if ai_config is None:
+        return default
+    return clean_text(getattr(ai_config, name, default))
 
 
 def now_text() -> str:
@@ -187,21 +193,43 @@ def word_payload(row: pd.Series) -> dict[str, object]:
     return payload
 
 
-class DeepSeekClient:
-    def __init__(self, api_key: str) -> None:
-        self.api_key = api_key.strip()
-        self.base_url = "https://api.deepseek.com"
-        self.model = "deepseek-chat"
+class AIClient:
+    def __init__(self) -> None:
+        self.provider = config_value("AI_PROVIDER", "deepseek").lower()
+        self.mode = "openai_compatible"
+
+        if self.provider == "openai":
+            self.api_key = config_value("OPENAI_API_KEY")
+            self.base_url = config_value("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+            self.model = config_value("OPENAI_MODEL", "gpt-4.1-mini")
+            self.label = "OpenAI"
+        elif self.provider == "gemini":
+            self.api_key = config_value("GEMINI_API_KEY")
+            self.base_url = config_value("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
+            self.model = config_value("GEMINI_MODEL", "gemini-2.0-flash")
+            self.mode = "gemini"
+            self.label = "Gemini"
+        elif self.provider == "custom_openai_compatible":
+            self.api_key = config_value("CUSTOM_OPENAI_COMPATIBLE_API_KEY")
+            self.base_url = config_value("CUSTOM_OPENAI_COMPATIBLE_BASE_URL").rstrip("/")
+            self.model = config_value("CUSTOM_OPENAI_COMPATIBLE_MODEL")
+            self.label = "OpenAI-compatible"
+        else:
+            self.provider = "deepseek"
+            self.api_key = config_value("DEEPSEEK_API_KEY")
+            self.base_url = config_value("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+            self.model = config_value("DEEPSEEK_MODEL", "deepseek-chat")
+            self.label = "DeepSeek"
 
     def available(self) -> bool:
-        return bool(self.api_key) and requests is not None
+        return bool(self.api_key and self.model and self.base_url) and requests is not None
+
+    def status_text(self) -> str:
+        if self.available():
+            return f"{self.label} API 已配置"
+        return f"{self.label} API 尚未完整配置"
 
     def enrich_word(self, word: str) -> dict[str, str]:
-        if not self.api_key:
-            raise DeepSeekError("还没有填写 DeepSeek API Key。")
-        if requests is None:
-            raise DeepSeekError("缺少 requests，请先运行：pip install -r requirements.txt")
-
         prompt = f"""
 你要为一名正在备考 TOEFL iBT 的中文母语学习者生成英语单词学习卡片。
 目标单词："{word}"
@@ -223,31 +251,19 @@ collocations, synonyms, antonyms, memory_tip, toefl_writing_use
 10. 不确定或不适合的字段返回空字符串。
 """.strip()
 
-        response = requests.post(
-            f"{self.base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": "你是一个严谨的 TOEFL 英语词汇教练。"},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.2,
-                "response_format": {"type": "json_object"},
-            },
-            timeout=45,
+        content = self._complete(
+            messages=[
+                {"role": "system", "content": "你是一个严谨的 TOEFL 英语词汇教练。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            json_mode=True,
         )
-        if response.status_code >= 400:
-            raise DeepSeekError(f"DeepSeek 请求失败：HTTP {response.status_code}")
 
         try:
-            content = response.json()["choices"][0]["message"]["content"]
             data = json.loads(content)
         except Exception as exc:
-            raise DeepSeekError("DeepSeek 返回内容不是可解析的 JSON。") from exc
+            raise DeepSeekError(f"{self.label} 返回内容不是可解析的 JSON。") from exc
 
         return {
             "Phonetic": clean_text(data.get("phonetic", "")),
@@ -264,11 +280,6 @@ collocations, synonyms, antonyms, memory_tip, toefl_writing_use
         }
 
     def chat(self, messages: list[dict[str, str]], book_name: str) -> str:
-        if not self.api_key:
-            raise DeepSeekError("还没有填写 DeepSeek API Key。")
-        if requests is None:
-            raise DeepSeekError("缺少 requests，请先运行：pip install -r requirements.txt")
-
         system_prompt = f"""
 你是一个 TOEFL 备考学习助手，正在帮助中文母语学习者使用本地单词本复习。
 当前单词本：{book_name}
@@ -283,27 +294,99 @@ collocations, synonyms, antonyms, memory_tip, toefl_writing_use
 
         payload_messages = [{"role": "system", "content": system_prompt}]
         payload_messages.extend(messages[-12:])
+        return self._complete(payload_messages, temperature=0.35, json_mode=False)
 
+    def _complete(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float,
+        json_mode: bool,
+    ) -> str:
+        if not self.api_key:
+            raise DeepSeekError(f"还没有填写 {self.label} API Key。")
+        if requests is None:
+            raise DeepSeekError("缺少 requests，请先运行：pip install -r requirements.txt")
+        if self.mode == "gemini":
+            return self._gemini_complete(messages, temperature, json_mode)
+        return self._openai_compatible_complete(messages, temperature, json_mode)
+
+    def _openai_compatible_complete(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float,
+        json_mode: bool,
+    ) -> str:
+        body: dict[str, object] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+        }
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
         response = requests.post(
             f"{self.base_url}/chat/completions",
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": self.model,
-                "messages": payload_messages,
-                "temperature": 0.35,
-            },
+            json=body,
             timeout=60,
         )
         if response.status_code >= 400:
-            raise DeepSeekError(f"DeepSeek 请求失败：HTTP {response.status_code}")
-
+            raise DeepSeekError(f"{self.label} 请求失败：HTTP {response.status_code}")
         try:
             return clean_text(response.json()["choices"][0]["message"]["content"])
         except Exception as exc:
-            raise DeepSeekError("DeepSeek 返回内容无法解析。") from exc
+            raise DeepSeekError(f"{self.label} 返回内容无法解析。") from exc
+
+    def _gemini_complete(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float,
+        json_mode: bool,
+    ) -> str:
+        system_parts = []
+        contents = []
+        for message in messages:
+            role = message.get("role", "user")
+            content = clean_text(message.get("content", ""))
+            if not content:
+                continue
+            if role == "system":
+                system_parts.append({"text": content})
+            else:
+                contents.append(
+                    {
+                        "role": "model" if role == "assistant" else "user",
+                        "parts": [{"text": content}],
+                    }
+                )
+
+        generation_config: dict[str, object] = {"temperature": temperature}
+        if json_mode:
+            generation_config["response_mime_type"] = "application/json"
+
+        body: dict[str, object] = {
+            "contents": contents,
+            "generationConfig": generation_config,
+        }
+        if system_parts:
+            body["systemInstruction"] = {"parts": system_parts}
+
+        response = requests.post(
+            f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}",
+            headers={"Content-Type": "application/json"},
+            json=body,
+            timeout=60,
+        )
+        if response.status_code >= 400:
+            raise DeepSeekError(f"{self.label} 请求失败：HTTP {response.status_code}")
+
+        try:
+            parts = response.json()["candidates"][0]["content"]["parts"]
+            return clean_text("".join(part.get("text", "") for part in parts))
+        except Exception as exc:
+            raise DeepSeekError(f"{self.label} 返回内容无法解析。") from exc
 
 
 class VocabStore:
@@ -568,7 +651,7 @@ class VocabStore:
 class App:
     def __init__(self) -> None:
         self.store = VocabStore(DATABASE_DIR)
-        self.deepseek = DeepSeekClient(DEEPSEEK_API_KEY)
+        self.ai = AIClient()
 
     def enrich_and_save(self, book_name: str, english: str, note: str) -> dict[str, object]:
         if self.store.duplicate_in_book(book_name, english):
@@ -577,12 +660,12 @@ class App:
         source = "local_cache"
         warning = ""
         if info is None:
-            source = "deepseek"
+            source = self.ai.provider
             try:
-                info = self.deepseek.enrich_word(english)
+                info = self.ai.enrich_word(english)
             except DeepSeekError as exc:
                 info = None
-                source = "pending_deepseek"
+                source = f"pending_{self.ai.provider}"
                 warning = str(exc)
         row = self.store.add_word(book_name, english, info, note, source)
         return {"word": row, "info": word_info(row), "source": source, "warning": warning}
@@ -689,10 +772,10 @@ def render_sidebar() -> None:
                     st.error(str(exc))
 
         st.divider()
-        if APP.deepseek.available():
-            st.success("DeepSeek API 已配置")
+        if APP.ai.available():
+            st.success(APP.ai.status_text())
         else:
-            st.warning("DeepSeek API Key 尚未填写")
+            st.warning(APP.ai.status_text())
         st.caption(f"数据库：{DATABASE_DIR}")
 
 
@@ -843,11 +926,11 @@ def render_extra_page() -> None:
 
 
 def render_chat_page() -> None:
-    st.subheader("DeepSeek 聊天")
+    st.subheader("AI 聊天")
     st.caption("这里可以问 TOEFL 单词、例句、写作表达和口语思路。聊天记录只保存在当前页面会话里，不会写入 Excel。")
 
-    if not APP.deepseek.available():
-        st.warning("DeepSeek API Key 尚未填写。请先在 deepseek_config.py 里填写 DEEPSEEK_API_KEY。")
+    if not APP.ai.available():
+        st.warning(f"{APP.ai.label} API 尚未完整配置。请先在 ai_config.py 里填写对应配置。")
 
     c1, c2 = st.columns([1, 1])
     with c1:
@@ -861,7 +944,7 @@ def render_chat_page() -> None:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    prompt = st.chat_input("问 DeepSeek：比如 explain ubiquitous for TOEFL writing")
+    prompt = st.chat_input(f"问 {APP.ai.label}：比如 explain ubiquitous for TOEFL writing")
     if prompt:
         user_message = {"role": "user", "content": prompt}
         st.session_state.chat_messages.append(user_message)
@@ -870,8 +953,8 @@ def render_chat_page() -> None:
 
         with st.chat_message("assistant"):
             try:
-                with st.spinner("DeepSeek 正在思考..."):
-                    answer = APP.deepseek.chat(st.session_state.chat_messages, current_book())
+                with st.spinner(f"{APP.ai.label} 正在思考..."):
+                    answer = APP.ai.chat(st.session_state.chat_messages, current_book())
                 st.markdown(answer)
                 st.session_state.chat_messages.append({"role": "assistant", "content": answer})
             except DeepSeekError as exc:
@@ -886,7 +969,7 @@ def render_app() -> None:
     st.title("TOEFL Excel 背单词")
     page = st.radio(
         "页面",
-        ["输入新词", "复习", "单词本详情", "DeepSeek 聊天", "扩展"],
+        ["输入新词", "复习", "单词本详情", "AI 聊天", "扩展"],
         horizontal=True,
         key="page_radio",
         label_visibility="collapsed",
@@ -897,7 +980,7 @@ def render_app() -> None:
         render_review_page()
     elif page == "单词本详情":
         render_detail_page()
-    elif page == "DeepSeek 聊天":
+    elif page == "AI 聊天":
         render_chat_page()
     else:
         render_extra_page()

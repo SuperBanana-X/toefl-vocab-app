@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 
 # Secrets
-deepseek_config.py
+ai_config.py
 
 # Local database
 Voc_Database/
