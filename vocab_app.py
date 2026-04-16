@@ -52,6 +52,7 @@ WORD_COLUMNS = [
     "Wrong_Count",
     "Note",
     "Source",
+    "AI_Status",
     "Created_At",
     "Updated_At",
 ]
@@ -85,10 +86,12 @@ TEXT_COLUMNS = [
     "Last_Review",
     "Note",
     "Source",
+    "AI_Status",
     "Created_At",
     "Updated_At",
 ]
 INT_COLUMNS = ["ID", "Mastery", "Correct_Count", "Wrong_Count"]
+AI_STATUS_VALUES = {"pending", "done", "failed"}
 
 
 class VocabDataError(Exception):
@@ -110,8 +113,29 @@ def now_text() -> str:
 
 
 def clean_text(value: object) -> str:
-    if pd.isna(value):
+    if value is None:
         return ""
+    if isinstance(value, dict):
+        cleaned = {str(key): clean_text(item) for key, item in value.items()}
+        cleaned = {key: item for key, item in cleaned.items() if item}
+        return json.dumps(cleaned, ensure_ascii=False) if cleaned else ""
+    if isinstance(value, (list, tuple, set)):
+        parts = []
+        for item in value:
+            item_text = clean_text(item)
+            if item_text:
+                parts.append(item_text)
+        return "; ".join(parts)
+    if not isinstance(value, (str, bytes)) and hasattr(value, "tolist"):
+        try:
+            return clean_text(value.tolist())
+        except Exception:
+            pass
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
     text = str(value).strip()
     return "" if text.lower() == "nan" else text
 
@@ -148,6 +172,18 @@ def normalize_datetime_column(df: pd.DataFrame, column: str) -> list[str]:
     return [value.strftime(DATE_FORMAT) if pd.notna(value) else "" for value in values]
 
 
+def has_completed_info(row: pd.Series | dict[str, object]) -> bool:
+    chinese = clean_text(row.get("Chinese", ""))
+    return bool(chinese and chinese != "待补充")
+
+
+def normalize_ai_status(row: pd.Series | dict[str, object]) -> str:
+    status = clean_text(row.get("AI_Status", "")).lower()
+    if status in AI_STATUS_VALUES:
+        return status
+    return "done" if has_completed_info(row) else "pending"
+
+
 def normalize_words(df: pd.DataFrame) -> pd.DataFrame:
     for column in WORD_COLUMNS:
         if column not in df.columns:
@@ -167,6 +203,7 @@ def normalize_words(df: pd.DataFrame) -> pd.DataFrame:
     timestamp = now_text()
     df["Created_At"] = df["Created_At"].replace("", timestamp)
     df["Updated_At"] = df["Updated_At"].replace("", timestamp)
+    df["AI_Status"] = df.apply(normalize_ai_status, axis=1)
     extra_columns = [column for column in df.columns if column not in WORD_COLUMNS]
     return df[WORD_COLUMNS + extra_columns]
 
@@ -188,6 +225,7 @@ def word_payload(row: pd.Series) -> dict[str, object]:
             "Wrong_Count": int(row.get("Wrong_Count", 0)),
             "Note": clean_text(row.get("Note", "")),
             "Source": clean_text(row.get("Source", "")),
+            "AI_Status": normalize_ai_status(row),
         }
     )
     return payload
@@ -249,6 +287,7 @@ collocations, synonyms, antonyms, memory_tip, toefl_writing_use
 8. memory_tip：用中文给一个简短记忆提示。
 9. toefl_writing_use：说明这个词在 TOEFL 写作/口语中如何使用，给一个短语级模板。
 10. 不确定或不适合的字段返回空字符串。
+11. 所有字段的值都必须是字符串，不要返回数组或对象；多个项目用分号分隔。
 """.strip()
 
         content = self._complete(
@@ -518,7 +557,15 @@ class VocabStore:
                     return word_info(row)
         return None
 
-    def add_word(self, book_name: str, english: str, info: dict[str, str] | None, note: str, source: str) -> dict[str, object]:
+    def add_word(
+        self,
+        book_name: str,
+        english: str,
+        info: dict[str, str] | None,
+        note: str,
+        source: str,
+        ai_status: str | None = None,
+    ) -> dict[str, object]:
         english = english.strip()
         if not english:
             raise VocabDataError("英文单词不能为空。")
@@ -529,6 +576,9 @@ class VocabStore:
         next_id = int(max_id) + 1 if pd.notna(max_id) else 1
         info = info or {}
         timestamp = now_text()
+        status = clean_text(ai_status).lower()
+        if status not in AI_STATUS_VALUES:
+            status = "done" if has_completed_info(info) else "pending"
         row = {
             "ID": next_id,
             "English": english,
@@ -550,12 +600,72 @@ class VocabStore:
             "Wrong_Count": 0,
             "Note": note.strip(),
             "Source": source,
+            "AI_Status": status,
             "Created_At": timestamp,
             "Updated_At": timestamp,
         }
         df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
         self.save_words(book_name, df)
         return row
+
+    def ai_pending_ids(self, book_name: str, include_failed: bool = True) -> list[int]:
+        df = self.load_words(book_name)
+        valid = self.valid_indices(book_name)
+        if not valid:
+            return []
+        statuses = df.loc[valid, "AI_Status"].map(clean_text).str.lower()
+        wanted = {"pending", "failed"} if include_failed else {"pending"}
+        mask = statuses.isin(wanted) | df.loc[valid, "Chinese"].map(clean_text).eq("待补充")
+        return [int(df.at[index, "ID"]) for index in statuses[mask].index]
+
+    def ai_pending_count(self, book_name: str, include_failed: bool = True) -> int:
+        return len(self.ai_pending_ids(book_name, include_failed=include_failed))
+
+    def word_by_id(self, book_name: str, word_id: int) -> pd.Series:
+        df = self.load_words(book_name)
+        matches = df.index[df["ID"] == int(word_id)].tolist()
+        if not matches:
+            raise VocabDataError("这个单词不存在，请重新读取 Excel。")
+        return df.loc[matches[0]]
+
+    def update_word_info(
+        self,
+        book_name: str,
+        word_id: int,
+        info: dict[str, str],
+        source: str,
+        ai_status: str = "done",
+    ) -> dict[str, object]:
+        df = self.load_words(book_name)
+        matches = df.index[df["ID"] == int(word_id)].tolist()
+        if not matches:
+            raise VocabDataError("这个单词不存在，请重新读取 Excel。")
+        index = matches[0]
+        for field in INFO_FIELDS:
+            value = clean_text(info.get(field, ""))
+            if value:
+                df.at[index, field] = value
+        if not clean_text(df.at[index, "Chinese"]):
+            df.at[index, "Chinese"] = "待补充"
+        status = clean_text(ai_status).lower()
+        df.at[index, "Source"] = source
+        df.at[index, "AI_Status"] = status if status in AI_STATUS_VALUES else normalize_ai_status(df.loc[index])
+        df.at[index, "Updated_At"] = now_text()
+        self.save_words(book_name, df)
+        return word_payload(df.loc[index])
+
+    def mark_ai_status(self, book_name: str, word_id: int, ai_status: str, source: str | None = None) -> None:
+        df = self.load_words(book_name)
+        matches = df.index[df["ID"] == int(word_id)].tolist()
+        if not matches:
+            raise VocabDataError("这个单词不存在，请重新读取 Excel。")
+        index = matches[0]
+        status = clean_text(ai_status).lower()
+        df.at[index, "AI_Status"] = status if status in AI_STATUS_VALUES else "pending"
+        if source:
+            df.at[index, "Source"] = source
+        df.at[index, "Updated_At"] = now_text()
+        self.save_words(book_name, df)
 
     def valid_indices(self, book_name: str) -> list[int]:
         df = self.load_words(book_name)
@@ -653,11 +763,27 @@ class App:
         self.store = VocabStore(DATABASE_DIR)
         self.ai = AIClient()
 
+    def add_word_fast(self, book_name: str, english: str, note: str) -> dict[str, object]:
+        if self.store.duplicate_in_book(book_name, english):
+            raise VocabDataError("当前词库已经有这个单词了。")
+        info = self.store.cached_info(english)
+        if info is not None:
+            row = self.store.add_word(book_name, english, info, note, "local_cache", "done")
+            return {"word": row, "info": word_info(row), "source": "local_cache", "warning": ""}
+        row = self.store.add_word(book_name, english, None, note, "manual_pending", "pending")
+        return {
+            "word": row,
+            "info": word_info(row),
+            "source": "manual_pending",
+            "warning": "已快速保存，AI 资料可稍后批量补全。",
+        }
+
     def enrich_and_save(self, book_name: str, english: str, note: str) -> dict[str, object]:
         if self.store.duplicate_in_book(book_name, english):
             raise VocabDataError("当前词库已经有这个单词了。")
         info = self.store.cached_info(english)
         source = "local_cache"
+        status = "done"
         warning = ""
         if info is None:
             source = self.ai.provider
@@ -666,9 +792,46 @@ class App:
             except DeepSeekError as exc:
                 info = None
                 source = f"pending_{self.ai.provider}"
+                status = "failed"
                 warning = str(exc)
-        row = self.store.add_word(book_name, english, info, note, source)
+        row = self.store.add_word(book_name, english, info, note, source, status)
         return {"word": row, "info": word_info(row), "source": source, "warning": warning}
+
+    def enrich_existing_word(self, book_name: str, word_id: int) -> dict[str, object]:
+        row = self.store.word_by_id(book_name, word_id)
+        english = clean_text(row.get("English", ""))
+        if not english:
+            raise VocabDataError("这个单词没有英文内容。")
+
+        info = self.store.cached_info(english)
+        source = "local_cache"
+        if info is None:
+            source = self.ai.provider
+            try:
+                info = self.ai.enrich_word(english)
+            except DeepSeekError as exc:
+                self.store.mark_ai_status(book_name, word_id, "failed", f"failed_{self.ai.provider}")
+                raise exc
+        updated = self.store.update_word_info(book_name, word_id, info, source, "done")
+        return {"word": updated, "info": word_info(updated), "source": source, "warning": ""}
+
+    def enrich_pending_words(self, book_name: str, limit: int) -> dict[str, object]:
+        pending_ids = self.store.ai_pending_ids(book_name)
+        selected_ids = pending_ids[: max(0, int(limit))]
+        result: dict[str, object] = {"done": 0, "failed": 0, "skipped": 0, "messages": []}
+        messages: list[str] = []
+        for word_id in selected_ids:
+            try:
+                enriched = self.enrich_existing_word(book_name, word_id)
+                word = enriched["word"]
+                result["done"] = int(result["done"]) + 1
+                messages.append(f"{word.get('English', '')}: done via {enriched['source']}")
+            except (VocabDataError, DeepSeekError) as exc:
+                result["failed"] = int(result["failed"]) + 1
+                messages.append(f"ID {word_id}: failed - {exc}")
+        result["skipped"] = max(0, len(pending_ids) - len(selected_ids))
+        result["messages"] = messages
+        return result
 
 
 APP = App()
@@ -697,6 +860,8 @@ def init_state() -> None:
         st.session_state.answer_visible = False
     if "last_preview" not in st.session_state:
         st.session_state.last_preview = "最近一次补全结果会显示在这里。"
+    if "last_added_id" not in st.session_state:
+        st.session_state.last_added_id = None
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = []
 
@@ -789,29 +954,68 @@ def render_metrics() -> None:
 
 def render_input_page() -> None:
     st.subheader("输入新词")
+    pending_count = APP.store.ai_pending_count(current_book())
+    st.caption(f"当前还有 {pending_count} 个单词等待 AI 补全。快速加入不会卡住背词节奏。")
     with st.form("add_word_form", clear_on_submit=True):
         english = st.text_input("英文单词")
         note = st.text_input("备注，可选")
-        submitted = st.form_submit_button("加入并补全")
+        col_fast, col_full = st.columns(2)
+        with col_fast:
+            fast_submitted = st.form_submit_button("快速加入", use_container_width=True)
+        with col_full:
+            enrich_submitted = st.form_submit_button("加入并补全", use_container_width=True)
 
-    if submitted:
+    if fast_submitted or enrich_submitted:
         if not english.strip():
             st.warning("请先输入英文单词。")
         else:
             try:
-                with st.spinner(f"正在处理 {english.strip()}，会优先使用本地缓存。"):
-                    result = APP.enrich_and_save(current_book(), english.strip(), note.strip())
+                if fast_submitted:
+                    result = APP.add_word_fast(current_book(), english.strip(), note.strip())
+                else:
+                    with st.spinner(f"正在处理 {english.strip()}，会优先使用本地缓存。"):
+                        result = APP.enrich_and_save(current_book(), english.strip(), note.strip())
                 info = result["info"]
                 lines = [f"单词：{english.strip()}", f"来源：{result['source']}"]
                 if result["warning"]:
                     lines.append(f"提示：{result['warning']}")
                 lines.extend([f"{field}：{info.get(field, '')}" for field in INFO_FIELDS])
                 st.session_state.last_preview = "\n".join(lines)
+                st.session_state.last_added_id = int(result["word"]["ID"])
                 st.session_state.current_word = None
                 st.session_state.answer_visible = False
                 st.success(f"{english.strip()} 已保存到 words.xlsx。")
             except (VocabDataError, DeepSeekError) as exc:
                 st.error(str(exc))
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("补全最近加入的单词", use_container_width=True):
+            if st.session_state.last_added_id is None:
+                st.warning("还没有最近加入的单词。")
+            else:
+                try:
+                    with st.spinner("正在补全最近加入的单词..."):
+                        result = APP.enrich_existing_word(current_book(), int(st.session_state.last_added_id))
+                    info = result["info"]
+                    lines = [f"单词：{result['word'].get('English', '')}", f"来源：{result['source']}"]
+                    lines.extend([f"{field}：{info.get(field, '')}" for field in INFO_FIELDS])
+                    st.session_state.last_preview = "\n".join(lines)
+                    st.success("最近加入的单词已补全并保存。")
+                except (VocabDataError, DeepSeekError) as exc:
+                    st.error(str(exc))
+    with c2:
+        batch_limit = st.number_input("本次批量补全数量", min_value=1, max_value=50, value=10, step=1)
+
+    if st.button("批量补全未完成单词", use_container_width=True):
+        if pending_count == 0:
+            st.info("当前没有等待补全的单词。")
+        else:
+            with st.spinner("正在批量补全，成功一个就会立刻写入 Excel..."):
+                result = APP.enrich_pending_words(current_book(), int(batch_limit))
+            messages = result["messages"]
+            st.session_state.last_preview = "\n".join(messages) if messages else "没有需要补全的单词。"
+            st.success(f"批量补全完成：成功 {result['done']} 个，失败 {result['failed']} 个，未处理 {result['skipped']} 个。")
 
     if st.button("停止输入，开始复习"):
         result = APP.store.backup_if_changed(current_book())
