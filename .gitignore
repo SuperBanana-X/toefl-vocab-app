@@ -14,3 +14,5 @@ Voc_Database/
 
 # Local-only launcher
 run_app_local.sh
+
+start_vocab.command
