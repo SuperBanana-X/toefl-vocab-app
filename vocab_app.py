@@ -667,6 +667,33 @@ class VocabStore:
         df.at[index, "Updated_At"] = now_text()
         self.save_words(book_name, df)
 
+    def update_word_basic(self, book_name: str, word_id: int, english: str, note: str) -> dict[str, object]:
+        english = clean_text(english)
+        if not english:
+            raise VocabDataError("英文单词不能为空。")
+
+        df = self.load_words(book_name)
+        matches = df.index[df["ID"] == int(word_id)].tolist()
+        if not matches:
+            raise VocabDataError("这个单词不存在，请重新读取 Excel。")
+        index = matches[0]
+
+        normalized = english.lower()
+        duplicate_mask = df["English"].astype(str).str.strip().str.lower().eq(normalized)
+        duplicate_mask.loc[index] = False
+        if duplicate_mask.any():
+            raise VocabDataError("当前词库已经有这个单词了。")
+
+        old_english = clean_text(df.at[index, "English"])
+        df.at[index, "English"] = english
+        df.at[index, "Note"] = clean_text(note)
+        if old_english.lower() != normalized:
+            df.at[index, "Source"] = "manual_edit"
+            df.at[index, "AI_Status"] = "pending"
+        df.at[index, "Updated_At"] = now_text()
+        self.save_words(book_name, df)
+        return word_payload(df.loc[index])
+
     def valid_indices(self, book_name: str) -> list[int]:
         df = self.load_words(book_name)
         return df[df["English"].astype(str).str.strip().ne("")].index.tolist()
@@ -862,6 +889,8 @@ def init_state() -> None:
         st.session_state.last_preview = "最近一次补全结果会显示在这里。"
     if "last_added_id" not in st.session_state:
         st.session_state.last_added_id = None
+    if "detail_message" not in st.session_state:
+        st.session_state.detail_message = ""
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = []
 
@@ -1116,12 +1145,83 @@ def render_detail_page() -> None:
     details = APP.store.book_details(current_book())
     render_metrics()
     st.subheader("单词本内部信息")
+    if st.session_state.detail_message:
+        st.success(st.session_state.detail_message)
+        st.session_state.detail_message = ""
     st.write("单词本文件夹：", details["book_path"])
     st.write("Excel 文件：", details["excel_path"])
     st.write("最近修改：", details["modified_at"])
     st.write("备份数量：", details["backup_count"])
     st.write("最新备份：", details["latest_backup"] or "暂无")
     st.dataframe(details["dataframe"], use_container_width=True, height=420)
+
+    st.divider()
+    st.subheader("修改单词")
+    df = details["dataframe"]
+    valid_df = df[df["English"].astype(str).str.strip().ne("")]
+    if valid_df.empty:
+        st.info("当前词库还没有可以修改的单词。")
+        return
+
+    st.caption("可以输入 ID 精确定位，也可以搜索拼错的英文片段。搜索到多个结果时，把目标 ID 填到左侧。")
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        raw_id = st.text_input("按 ID 定位", placeholder="例如：17")
+    with c2:
+        query = st.text_input("搜索英文单词", placeholder="输入拼错的单词或其中一部分")
+
+    selected_id: int | None = None
+    valid_ids = set(valid_df["ID"].astype(int).tolist())
+    if raw_id.strip():
+        try:
+            candidate_id = int(raw_id.strip())
+            if candidate_id in valid_ids:
+                selected_id = candidate_id
+            else:
+                st.warning("这个 ID 不在当前词库里。")
+        except ValueError:
+            st.warning("ID 需要输入数字。")
+
+    if query.strip():
+        normalized_query = re.escape(query.strip())
+        matches = valid_df[
+            valid_df["English"].astype(str).str.contains(normalized_query, case=False, na=False, regex=True)
+        ].sort_values("ID")
+        if matches.empty:
+            st.info("没有找到匹配的单词。")
+        else:
+            visible_columns = ["ID", "English", "Chinese", "Note", "AI_Status"]
+            st.dataframe(matches[visible_columns].head(30), use_container_width=True, hide_index=True)
+            if selected_id is None:
+                exact_matches = matches[matches["English"].astype(str).str.strip().str.lower() == query.strip().lower()]
+                if len(exact_matches) == 1:
+                    selected_id = int(exact_matches.iloc[0]["ID"])
+                elif len(matches) == 1:
+                    selected_id = int(matches.iloc[0]["ID"])
+                else:
+                    st.info("找到多个匹配结果，请把要修改的 ID 填到左侧。")
+
+    if selected_id is None:
+        st.info("先输入 ID，或搜索一个能唯一定位的单词。")
+        return
+
+    selected_row = APP.store.word_by_id(current_book(), selected_id)
+    st.caption(f"正在修改：ID {selected_id} | {clean_text(selected_row.get('English', ''))}")
+
+    with st.form("edit_word_form"):
+        new_english = st.text_input("英文单词", value=clean_text(selected_row.get("English", "")))
+        new_note = st.text_input("备注", value=clean_text(selected_row.get("Note", "")))
+        submitted = st.form_submit_button("保存修改")
+
+    if submitted:
+        try:
+            updated = APP.store.update_word_basic(current_book(), selected_id, new_english, new_note)
+            st.session_state.current_word = None
+            st.session_state.answer_visible = False
+            st.session_state.detail_message = f"{updated['English']} 已保存到 words.xlsx。"
+            st.rerun()
+        except VocabDataError as exc:
+            st.error(str(exc))
 
 
 def render_extra_page() -> None:
