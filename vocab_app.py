@@ -32,6 +32,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 DATABASE_DIR = PROJECT_DIR / "Voc_Database"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 DEFAULT_BOOK_NAME = "默认词库"
+PAGE_OPTIONS = ["输入新词", "复习", "练习", "单词本详情", "扩展"]
 
 WORD_COLUMNS = [
     "ID",
@@ -53,6 +54,7 @@ WORD_COLUMNS = [
     "Correct_Count",
     "Wrong_Count",
     "Forget_Level",
+    "Practice_Status",
     "Note",
     "Source",
     "AI_Status",
@@ -88,6 +90,7 @@ TEXT_COLUMNS = [
     "Next_Review",
     "Last_Review",
     "Forget_Level",
+    "Practice_Status",
     "Note",
     "Source",
     "AI_Status",
@@ -96,6 +99,7 @@ TEXT_COLUMNS = [
 ]
 INT_COLUMNS = ["ID", "Mastery", "Correct_Count", "Wrong_Count"]
 AI_STATUS_VALUES = {"pending", "done", "failed"}
+PRACTICE_STATUS_VALUES = {"active", "mastered"}
 
 
 class VocabDataError(Exception):
@@ -234,6 +238,13 @@ def normalize_ai_status(row: pd.Series | dict[str, object]) -> str:
     return "done" if has_completed_info(row) else "pending"
 
 
+def normalize_practice_status(row: pd.Series | dict[str, object]) -> str:
+    status = clean_text(row.get("Practice_Status", "")).lower()
+    if status in PRACTICE_STATUS_VALUES:
+        return status
+    return "active"
+
+
 def normalize_words(df: pd.DataFrame) -> pd.DataFrame:
     for column in WORD_COLUMNS:
         if column not in df.columns:
@@ -255,6 +266,7 @@ def normalize_words(df: pd.DataFrame) -> pd.DataFrame:
     df["Created_At"] = df["Created_At"].replace("", timestamp)
     df["Updated_At"] = df["Updated_At"].replace("", timestamp)
     df["AI_Status"] = df.apply(normalize_ai_status, axis=1)
+    df["Practice_Status"] = df.apply(normalize_practice_status, axis=1)
     extra_columns = [column for column in df.columns if column not in WORD_COLUMNS]
     return df[WORD_COLUMNS + extra_columns]
 
@@ -315,6 +327,7 @@ def word_payload(row: pd.Series) -> dict[str, object]:
             "Correct_Count": int(row.get("Correct_Count", 0)),
             "Wrong_Count": int(row.get("Wrong_Count", 0)),
             "Forget_Level": clean_text(row.get("Forget_Level", "")),
+            "Practice_Status": normalize_practice_status(row),
             "Note": clean_text(row.get("Note", "")),
             "Source": clean_text(row.get("Source", "")),
             "AI_Status": normalize_ai_status(row),
@@ -691,6 +704,7 @@ class VocabStore:
             "Last_Review": "",
             "Correct_Count": 0,
             "Wrong_Count": 0,
+            "Practice_Status": "active",
             "Note": note.strip(),
             "Source": source,
             "AI_Status": status,
@@ -818,6 +832,38 @@ class VocabStore:
             return None
         return word_payload(df.loc[random.choice(due)])
 
+    def forgotten_indices(self, book_name: str) -> list[int]:
+        df = self.load_words(book_name)
+        valid = self.valid_indices(book_name)
+        if not valid:
+            return []
+        wrong_count = pd.to_numeric(df.loc[valid, "Wrong_Count"], errors="coerce").fillna(0)
+        practice_status = df.loc[valid, "Practice_Status"].map(clean_text).str.lower()
+        active_mask = practice_status.ne("mastered")
+        return list(wrong_count[(wrong_count >= 1) & active_mask].index)
+
+    def forgotten_count(self, book_name: str) -> int:
+        return len(self.forgotten_indices(book_name))
+
+    def next_forgotten_word(self, book_name: str, exclude_id: int | None = None) -> dict[str, object] | None:
+        df = self.load_words(book_name)
+        forgotten = self.forgotten_indices(book_name)
+        if exclude_id is not None and len(forgotten) > 1:
+            forgotten = [index for index in forgotten if int(df.at[index, "ID"]) != int(exclude_id)]
+        if not forgotten:
+            return None
+        return word_payload(df.loc[random.choice(forgotten)])
+
+    def mark_practice_mastered(self, book_name: str, word_id: int) -> None:
+        df = self.load_words(book_name)
+        matches = df.index[df["ID"] == int(word_id)].tolist()
+        if not matches:
+            raise VocabDataError("这个单词不存在，请重新读取 Excel。")
+        index = matches[0]
+        df.at[index, "Practice_Status"] = "mastered"
+        df.at[index, "Updated_At"] = now_text()
+        self.save_words(book_name, df)
+
     def answer(self, book_name: str, word_id: int, remembered: bool) -> None:
         df = self.load_words(book_name)
         matches = df.index[df["ID"] == int(word_id)].tolist()
@@ -832,15 +878,24 @@ class VocabStore:
             mastery += 1
             correct_count += 1
             if mastery == 1:
-                next_review = current + timedelta(hours=12)
+                next_review = current + timedelta(minutes=30)
             elif mastery == 2:
+                next_review = current + timedelta(hours=12)
+            elif mastery == 3:
                 next_review = current + timedelta(days=1)
-            else:
+            elif mastery == 4:
                 next_review = current + timedelta(days=3)
+            elif mastery == 5:
+                next_review = current + timedelta(days=7)
+            elif mastery == 6:
+                next_review = current + timedelta(days=15)
+            else:
+                next_review = current + timedelta(days=30)
         else:
             mastery = 0
             wrong_count += 1
             next_review = current + timedelta(minutes=5)
+            df.at[index, "Practice_Status"] = "active"
         df.at[index, "Mastery"] = mastery
         df.at[index, "Correct_Count"] = correct_count
         df.at[index, "Wrong_Count"] = wrong_count
@@ -968,6 +1023,8 @@ def running_in_streamlit() -> bool:
 def init_state() -> None:
     if "page_radio" not in st.session_state:
         st.session_state.page_radio = "输入新词"
+    if st.session_state.page_radio not in PAGE_OPTIONS:
+        st.session_state.page_radio = "练习"
     if st.session_state.get("_go_review"):
         st.session_state.page_radio = "复习"
         del st.session_state["_go_review"]
@@ -978,15 +1035,16 @@ def init_state() -> None:
         st.session_state.current_word = None
     if "answer_visible" not in st.session_state:
         st.session_state.answer_visible = False
+    if "practice_word" not in st.session_state:
+        st.session_state.practice_word = None
+    if "practice_answer_visible" not in st.session_state:
+        st.session_state.practice_answer_visible = False
     if "last_preview" not in st.session_state:
         st.session_state.last_preview = "最近一次补全结果会显示在这里。"
     if "last_added_id" not in st.session_state:
         st.session_state.last_added_id = None
     if "detail_message" not in st.session_state:
         st.session_state.detail_message = ""
-    if "chat_messages" not in st.session_state:
-        st.session_state.chat_messages = []
-
 
 def apply_style() -> None:
     st.markdown(
@@ -1028,6 +1086,8 @@ def set_current_book(book_name: str) -> None:
         st.session_state.current_book = book_name
         st.session_state.current_word = None
         st.session_state.answer_visible = False
+        st.session_state.practice_word = None
+        st.session_state.practice_answer_visible = False
 
 
 def render_sidebar() -> None:
@@ -1257,6 +1317,79 @@ def render_review_page() -> None:
                 st.rerun()
 
 
+def ensure_practice_word() -> None:
+    if st.session_state.practice_word is None:
+        st.session_state.practice_word = APP.store.next_forgotten_word(current_book())
+        st.session_state.practice_answer_visible = False
+
+
+def practice_detail_text(word: dict[str, object]) -> str:
+    return "\n".join(
+        [
+            f"中文：{word.get('Chinese', '')}",
+            f"例句翻译：{word.get('Example_CN', '')}",
+            f"TOEFL 语境：{word.get('TOEFL_Context', '')}",
+            f"搭配：{word.get('Collocations', '')}",
+            f"记忆提示：{word.get('Memory_Tip', '')}",
+        ]
+    )
+
+
+def render_practice_page() -> None:
+    render_metrics()
+    forgotten_count = APP.store.forgotten_count(current_book())
+    st.subheader("遗忘词练习")
+    st.caption(f"当前有 {forgotten_count} 个遗忘词。这里只抽取忘记过至少 1 次的词，方便集中训练。")
+
+    ensure_practice_word()
+    word = st.session_state.practice_word
+    if word is None:
+        st.success("当前没有遗忘词。正式复习里点过“忘记”的词会出现在这里。")
+        return
+
+    wrong_count = int(word.get("Wrong_Count", 0))
+    heat = review_heat_style(wrong_count)
+    st.markdown(
+        f'<div class="word-card" style="background:{heat["background"]};border-color:{heat["border"]};">',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div style="display:flex;justify-content:center;margin:8px 0 2px;">'
+        f'<span style="display:inline-block;border-radius:999px;padding:6px 12px;'
+        f'background:{heat["badge_bg"]};color:{heat["badge_text"]};font-size:14px;font-weight:600;">'
+        f'{heat["label"]}</span></div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(f'<div class="word-face">{word["English"]}</div>', unsafe_allow_html=True)
+    st.markdown(f'<p class="small-note" style="text-align:center;">音标：{word.get("Phonetic", "") or "待补充"}</p>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    example = clean_text(word.get("Example_EN", "")) or "这个词还没有例句。可以先去“输入新词”页面批量补全 AI 信息。"
+    st.text_area("例句", example, height=110)
+
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+    with c1:
+        if st.button("显示释义", use_container_width=True):
+            st.session_state.practice_answer_visible = True
+    with c2:
+        render_speech_button(str(word["English"]))
+    with c3:
+        if st.button("换一个遗忘词", use_container_width=True):
+            st.session_state.practice_word = APP.store.next_forgotten_word(current_book(), int(word["ID"]))
+            st.session_state.practice_answer_visible = False
+            st.rerun()
+    with c4:
+        if st.button("掌握，移出练习", type="primary", use_container_width=True):
+            APP.store.mark_practice_mastered(current_book(), int(word["ID"]))
+            st.session_state.practice_word = APP.store.next_forgotten_word(current_book(), int(word["ID"]))
+            st.session_state.practice_answer_visible = False
+            st.toast("已从练习池移出，正式复习计划不变。")
+            st.rerun()
+
+    if st.session_state.practice_answer_visible:
+        st.text_area("释义与补充", practice_detail_text(word), height=220)
+
+
 def render_detail_page() -> None:
     details = APP.store.book_details(current_book())
     render_metrics()
@@ -1345,42 +1478,6 @@ def render_extra_page() -> None:
     st.info("这个地方在施工。。。")
 
 
-def render_chat_page() -> None:
-    st.subheader("AI 聊天")
-    st.caption("这里可以问 TOEFL 单词、例句、写作表达和口语思路。聊天记录只保存在当前页面会话里，不会写入 Excel。")
-
-    if not APP.ai.available():
-        st.warning(f"{APP.ai.label} API 尚未完整配置。请先在 ai_config.py 里填写对应配置。")
-
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("清空聊天"):
-            st.session_state.chat_messages = []
-            st.rerun()
-    with c2:
-        st.caption(f"当前单词本：{current_book()}")
-
-    for message in st.session_state.chat_messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    prompt = st.chat_input(f"问 {APP.ai.label}：比如 explain ubiquitous for TOEFL writing")
-    if prompt:
-        user_message = {"role": "user", "content": prompt}
-        st.session_state.chat_messages.append(user_message)
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        with st.chat_message("assistant"):
-            try:
-                with st.spinner(f"{APP.ai.label} 正在思考..."):
-                    answer = APP.ai.chat(st.session_state.chat_messages, current_book())
-                st.markdown(answer)
-                st.session_state.chat_messages.append({"role": "assistant", "content": answer})
-            except DeepSeekError as exc:
-                st.error(str(exc))
-
-
 def render_app() -> None:
     st.set_page_config(page_title="TOEFL Excel 背单词", layout="wide")
     apply_style()
@@ -1389,7 +1486,7 @@ def render_app() -> None:
     st.title("TOEFL Excel 背单词")
     page = st.radio(
         "页面",
-        ["输入新词", "复习", "单词本详情", "AI 聊天", "扩展"],
+        PAGE_OPTIONS,
         horizontal=True,
         key="page_radio",
         label_visibility="collapsed",
@@ -1398,10 +1495,10 @@ def render_app() -> None:
         render_input_page()
     elif page == "复习":
         render_review_page()
+    elif page == "练习":
+        render_practice_page()
     elif page == "单词本详情":
         render_detail_page()
-    elif page == "AI 聊天":
-        render_chat_page()
     else:
         render_extra_page()
 
