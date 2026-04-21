@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill
 
 try:
     import requests
@@ -50,6 +52,7 @@ WORD_COLUMNS = [
     "Last_Review",
     "Correct_Count",
     "Wrong_Count",
+    "Forget_Level",
     "Note",
     "Source",
     "AI_Status",
@@ -84,6 +87,7 @@ TEXT_COLUMNS = [
     "TOEFL_Writing_Use",
     "Next_Review",
     "Last_Review",
+    "Forget_Level",
     "Note",
     "Source",
     "AI_Status",
@@ -172,6 +176,52 @@ def normalize_datetime_column(df: pd.DataFrame, column: str) -> list[str]:
     return [value.strftime(DATE_FORMAT) if pd.notna(value) else "" for value in values]
 
 
+def review_heat_profile(wrong_count: int) -> dict[str, str]:
+    if wrong_count >= 3:
+        return {
+            "label": "高频遗忘：3 次及以上",
+            "card_background": "rgba(185, 28, 28, 0.14)",
+            "card_border": "rgba(185, 28, 28, 0.42)",
+            "badge_bg": "rgba(185, 28, 28, 0.16)",
+            "badge_text": "#991b1b",
+            "table_bg": "#fee2e2",
+            "excel_fill": "FEE2E2",
+            "excel_font": "991B1B",
+        }
+    if wrong_count == 2:
+        return {
+            "label": "重复遗忘：2 次",
+            "card_background": "rgba(234, 88, 12, 0.12)",
+            "card_border": "rgba(234, 88, 12, 0.34)",
+            "badge_bg": "rgba(234, 88, 12, 0.14)",
+            "badge_text": "#c2410c",
+            "table_bg": "#ffedd5",
+            "excel_fill": "FFEDD5",
+            "excel_font": "C2410C",
+        }
+    if wrong_count == 1:
+        return {
+            "label": "第一次忘记：1 次",
+            "card_background": "rgba(217, 119, 6, 0.10)",
+            "card_border": "rgba(217, 119, 6, 0.28)",
+            "badge_bg": "rgba(217, 119, 6, 0.12)",
+            "badge_text": "#b45309",
+            "table_bg": "#fef3c7",
+            "excel_fill": "FEF3C7",
+            "excel_font": "B45309",
+        }
+    return {
+        "label": "目前还没有忘记记录",
+        "card_background": "#ffffff",
+        "card_border": "rgba(49, 51, 63, .16)",
+        "badge_bg": "rgba(71, 85, 105, 0.08)",
+        "badge_text": "#475569",
+        "table_bg": "#f8fafc",
+        "excel_fill": "F8FAFC",
+        "excel_font": "475569",
+    }
+
+
 def has_completed_info(row: pd.Series | dict[str, object]) -> bool:
     chinese = clean_text(row.get("Chinese", ""))
     return bool(chinese and chinese != "待补充")
@@ -198,6 +248,7 @@ def normalize_words(df: pd.DataFrame) -> pd.DataFrame:
         df[column] = df[column].clip(lower=0)
 
     df["ID"] = normalize_ids(df["ID"])
+    df["Forget_Level"] = df["Wrong_Count"].map(lambda count: review_heat_profile(int(count))["label"])
     df["Next_Review"] = normalize_datetime_column(df, "Next_Review")
     df["Last_Review"] = normalize_datetime_column(df, "Last_Review")
     timestamp = now_text()
@@ -212,6 +263,46 @@ def word_info(row: pd.Series | dict[str, object]) -> dict[str, str]:
     return {field: clean_text(row.get(field, "")) for field in INFO_FIELDS}
 
 
+def style_word_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    def row_style(row: pd.Series) -> list[str]:
+        wrong_count = int(row.get("Wrong_Count", 0))
+        profile = review_heat_profile(wrong_count)
+        styles: list[str] = []
+        for column in row.index:
+            if column in {"English", "Wrong_Count", "Forget_Level"}:
+                styles.append(
+                    f"background-color: {profile['table_bg']}; color: {profile['badge_text']}; font-weight: 600;"
+                )
+            else:
+                styles.append("")
+        return styles
+
+    return df.style.apply(row_style, axis=1)
+
+
+def apply_excel_review_heat(path: Path, df: pd.DataFrame) -> None:
+    workbook = load_workbook(path)
+    worksheet = workbook.active
+    headers = {cell.value: cell.column for cell in worksheet[1] if cell.value}
+    target_columns = [headers.get(name) for name in ("English", "Wrong_Count", "Forget_Level")]
+    target_columns = [column for column in target_columns if column is not None]
+
+    for row_number, (_, row) in enumerate(df.iterrows(), start=2):
+        wrong_count = int(row.get("Wrong_Count", 0))
+        profile = review_heat_profile(wrong_count)
+        fill = PatternFill(fill_type="solid", fgColor=profile["excel_fill"])
+        font = Font(color=profile["excel_font"], bold=wrong_count >= 3)
+        for column_number in target_columns:
+            cell = worksheet.cell(row=row_number, column=column_number)
+            cell.fill = fill
+            cell.font = font
+
+    if "Forget_Level" in headers:
+        worksheet.column_dimensions[worksheet.cell(row=1, column=headers["Forget_Level"]).column_letter].width = 18
+
+    workbook.save(path)
+
+
 def word_payload(row: pd.Series) -> dict[str, object]:
     payload = word_info(row)
     payload.update(
@@ -223,6 +314,7 @@ def word_payload(row: pd.Series) -> dict[str, object]:
             "Last_Review": clean_text(row.get("Last_Review", "")),
             "Correct_Count": int(row.get("Correct_Count", 0)),
             "Wrong_Count": int(row.get("Wrong_Count", 0)),
+            "Forget_Level": clean_text(row.get("Forget_Level", "")),
             "Note": clean_text(row.get("Note", "")),
             "Source": clean_text(row.get("Source", "")),
             "AI_Status": normalize_ai_status(row),
@@ -537,6 +629,7 @@ class VocabStore:
         df = normalize_words(df)
         try:
             df.to_excel(path, index=False, engine="openpyxl")
+            apply_excel_review_heat(path, df)
         except PermissionError as exc:
             raise VocabDataError(f"保存失败：请先关闭 Excel 中打开的 {path.name}。") from exc
         except Exception as exc:
@@ -1094,6 +1187,17 @@ def ensure_word() -> None:
         st.session_state.answer_visible = False
 
 
+def review_heat_style(wrong_count: int) -> dict[str, str]:
+    profile = review_heat_profile(wrong_count)
+    return {
+        "background": profile["card_background"],
+        "border": profile["card_border"],
+        "badge_bg": profile["badge_bg"],
+        "badge_text": profile["badge_text"],
+        "label": profile["label"],
+    }
+
+
 def render_review_page() -> None:
     render_metrics()
     ensure_word()
@@ -1107,8 +1211,20 @@ def render_review_page() -> None:
             st.success("今天的复习任务已完成。复习时间会按当前日期时间实时判断。")
         return
 
-    st.markdown('<div class="word-card">', unsafe_allow_html=True)
+    wrong_count = int(word.get("Wrong_Count", 0))
+    heat = review_heat_style(wrong_count)
+    st.markdown(
+        f'<div class="word-card" style="background:{heat["background"]};border-color:{heat["border"]};">',
+        unsafe_allow_html=True,
+    )
     st.markdown('<p class="small-note">先回忆中文、音标、例句和 TOEFL 使用场景，再显示答案。</p>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="display:flex;justify-content:center;margin:8px 0 2px;">'
+        f'<span style="display:inline-block;border-radius:999px;padding:6px 12px;'
+        f'background:{heat["badge_bg"]};color:{heat["badge_text"]};font-size:14px;font-weight:600;">'
+        f'{heat["label"]}</span></div>',
+        unsafe_allow_html=True,
+    )
     st.markdown(f'<div class="word-face">{word["English"]}</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1153,7 +1269,7 @@ def render_detail_page() -> None:
     st.write("最近修改：", details["modified_at"])
     st.write("备份数量：", details["backup_count"])
     st.write("最新备份：", details["latest_backup"] or "暂无")
-    st.dataframe(details["dataframe"], use_container_width=True, height=420)
+    st.dataframe(style_word_table(details["dataframe"]), use_container_width=True, height=420)
 
     st.divider()
     st.subheader("修改单词")
@@ -1190,8 +1306,8 @@ def render_detail_page() -> None:
         if matches.empty:
             st.info("没有找到匹配的单词。")
         else:
-            visible_columns = ["ID", "English", "Chinese", "Note", "AI_Status"]
-            st.dataframe(matches[visible_columns].head(30), use_container_width=True, hide_index=True)
+            visible_columns = ["ID", "English", "Chinese", "Wrong_Count", "Forget_Level", "Note", "AI_Status"]
+            st.dataframe(style_word_table(matches[visible_columns].head(30)), use_container_width=True)
             if selected_id is None:
                 exact_matches = matches[matches["English"].astype(str).str.strip().str.lower() == query.strip().lower()]
                 if len(exact_matches) == 1:
