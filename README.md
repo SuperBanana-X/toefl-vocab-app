@@ -1,6 +1,6 @@
-# TOEFL Excel 背单词
+# VocabFlow
 
-这是一个用 Streamlit 做面板、用 Excel 做本地数据库的 TOEFL 背单词小程序。
+这是一个用 Streamlit 做面板、用 Excel 做本地数据库的背单词程序。
 
 ## 运行
 
